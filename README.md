@@ -64,7 +64,7 @@ Capabilities cover editor access, buffer reads/writes, windows, settings, filesy
 
 Legacy Vim script is the initial target. Vim9 is represented by a language-version boundary for later work. The implementation should retain familiar syntax and compatibility semantics while using clean internal types and a modern VM.
 
-A practical implementation sequence is:
+The initial implementation sequence is complete:
 
 1. Source map, lexer, and diagnostics
 2. Expression and statement parser
@@ -76,5 +76,20 @@ A practical implementation sequence is:
 8. Ex commands, options, mappings, and autocommands
 9. Compatibility testing against selected Vim regression tests
 10. Incremental expansion toward plugin compatibility
+
+## Next steps: plugin compatibility
+
+Development now proceeds through compatibility-driven slices based on conventional plugin structure and real plugin failures:
+
+1. Module-owned function references
+2. Automatic autoload
+3. `exists()` and plugin load guards
+4. Source-preserving Ex parser
+5. User commands
+6. Mappings and autocommands
+7. First realistic plugin fixture
+8. Select and support a small external plugin
+
+Each slice should add focused regression and plugin-level integration tests. Compatibility gaps should be reported structurally rather than causing crashes, and host-facing behavior should remain asynchronous and capability-controlled.
 
 The difficult portion is behavioral compatibility accumulated over decades. Vim's documentation describes intended behavior; its source and regression suite settle ambiguous edge cases.

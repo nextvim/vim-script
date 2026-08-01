@@ -1,4 +1,4 @@
-use crate::ast::{BinaryOperator, UnaryOperator};
+use crate::ast::{BinaryOperator, ExCommand, UnaryOperator};
 use crate::resolver::FunctionId;
 use crate::source::{SourceId, Span};
 
@@ -14,6 +14,7 @@ pub enum Constant {
     String(String),
     Blob(Vec<u8>),
     Function(FunctionId),
+    Command(Box<ExCommand>),
 }
 
 /// Jump operands are absolute instruction indices within the current function.

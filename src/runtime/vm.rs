@@ -3,8 +3,9 @@ use std::sync::Arc;
 
 use crate::ast::{BinaryOperator, UnaryOperator};
 use crate::bytecode::{BytecodeModule, Constant, ConstantId, FunctionPrototype, Instruction};
+use crate::host::{CommandRequest, HostContext, HostRequest, HostTarget};
 use crate::resolver::FunctionId;
-use crate::runtime::{BuiltinRegistry, Closure, TaskId, Value};
+use crate::runtime::{BuiltinRegistry, Closure, OperationId, Value};
 use crate::source::Span;
 
 #[derive(Clone, Debug)]
@@ -34,9 +35,27 @@ pub struct ExceptionFrame {
 pub enum VmStatus {
     Ready,
     Running,
-    Suspended { waiting_on: TaskId },
+    Suspended { waiting_on: OperationId },
     Completed(Value),
     Failed(RuntimeError),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum StepOutcome {
+    Continue,
+    HostCall(HostRequest),
+    CommandCall(CommandRequest),
+    Waiting(OperationId),
+    Completed(Value),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum VmRunOutcome {
+    Yielded,
+    HostCall(HostRequest),
+    CommandCall(CommandRequest),
+    Waiting(OperationId),
+    Completed(Value),
 }
 
 #[derive(Clone, Debug)]
@@ -50,6 +69,7 @@ pub struct Vm {
     pub instruction_budget: Option<u64>,
     pub limits: ResourceLimits,
     pub builtins: BuiltinRegistry,
+    pub host_context: HostContext,
 }
 
 #[derive(Clone, Debug)]
@@ -137,21 +157,72 @@ impl Vm {
             instruction_budget: limits.max_instructions,
             limits,
             builtins: BuiltinRegistry::with_defaults(),
+            host_context: HostContext::default(),
         })
     }
 
     pub fn run(&mut self) -> RuntimeResult<Value> {
+        loop {
+            match self.run_quantum(usize::MAX)? {
+                VmRunOutcome::Completed(value) => return Ok(value),
+                VmRunOutcome::Yielded => continue,
+                VmRunOutcome::HostCall(request) => {
+                    return Err(self.error(
+                        RuntimeErrorKind::HostError,
+                        format!(
+                            "host call {} requires a scheduler and host runtime",
+                            request.function
+                        ),
+                    ));
+                }
+                VmRunOutcome::CommandCall(request) => {
+                    return Err(self.error(
+                        RuntimeErrorKind::HostError,
+                        format!(
+                            "command {} requires a scheduler and host runtime",
+                            request.command.name
+                        ),
+                    ));
+                }
+                VmRunOutcome::Waiting(operation) => {
+                    return Err(self.error(
+                        RuntimeErrorKind::HostError,
+                        format!(
+                            "VM suspended on operation {} without a scheduler",
+                            operation.0
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+
+    pub fn run_quantum(&mut self, quantum: usize) -> RuntimeResult<VmRunOutcome> {
         if let VmStatus::Completed(value) = &self.status {
-            return Ok(value.clone());
+            return Ok(VmRunOutcome::Completed(value.clone()));
         }
         self.status = VmStatus::Running;
-        loop {
+        for _ in 0..quantum {
             match self.step() {
-                Ok(Some(value)) => {
-                    self.status = VmStatus::Completed(value.clone());
-                    return Ok(value);
+                Ok(StepOutcome::Continue) => {}
+                Ok(StepOutcome::HostCall(request)) => {
+                    self.status = VmStatus::Ready;
+                    return Ok(VmRunOutcome::HostCall(request));
                 }
-                Ok(None) => {}
+                Ok(StepOutcome::CommandCall(request)) => {
+                    self.status = VmStatus::Ready;
+                    return Ok(VmRunOutcome::CommandCall(request));
+                }
+                Ok(StepOutcome::Waiting(operation)) => {
+                    self.status = VmStatus::Suspended {
+                        waiting_on: operation,
+                    };
+                    return Ok(VmRunOutcome::Waiting(operation));
+                }
+                Ok(StepOutcome::Completed(value)) => {
+                    self.status = VmStatus::Completed(value.clone());
+                    return Ok(VmRunOutcome::Completed(value));
+                }
                 Err(error) => {
                     if self.dispatch_catchable_error(&error)? {
                         continue;
@@ -161,9 +232,49 @@ impl Vm {
                 }
             }
         }
+        self.status = VmStatus::Ready;
+        Ok(VmRunOutcome::Yielded)
     }
 
-    pub fn step(&mut self) -> RuntimeResult<Option<Value>> {
+    pub fn suspend_for_operation(&mut self, operation: OperationId) {
+        self.status = VmStatus::Suspended {
+            waiting_on: operation,
+        };
+    }
+
+    pub fn resume_host_call(&mut self, result: RuntimeResult<OperationId>) -> RuntimeResult<()> {
+        match result {
+            Ok(operation) => self.push(Value::Future(operation))?,
+            Err(error) if self.dispatch_catchable_error(&error)? => {}
+            Err(error) => {
+                self.status = VmStatus::Failed(error.clone());
+                return Err(error);
+            }
+        }
+        self.status = VmStatus::Ready;
+        Ok(())
+    }
+
+    pub fn resume_await(&mut self, result: RuntimeResult<Value>) -> RuntimeResult<()> {
+        if !matches!(self.status, VmStatus::Suspended { .. }) {
+            return Err(self.error(
+                RuntimeErrorKind::Internal,
+                "cannot resume a VM that is not suspended",
+            ));
+        }
+        match result {
+            Ok(value) => self.push(value)?,
+            Err(error) if self.dispatch_catchable_error(&error)? => {}
+            Err(error) => {
+                self.status = VmStatus::Failed(error.clone());
+                return Err(error);
+            }
+        }
+        self.status = VmStatus::Ready;
+        Ok(())
+    }
+
+    pub fn step(&mut self) -> RuntimeResult<StepOutcome> {
         if let Some(budget) = &mut self.instruction_budget {
             if *budget == 0 {
                 return Err(self.error(
@@ -311,7 +422,11 @@ impl Vm {
                 let value = self.get_index(target, Value::String(Arc::from(name)))?;
                 self.push(value)?;
             }
-            Instruction::Call(argc) => self.call(argc)?,
+            Instruction::Call(argc) => {
+                if let Some(request) = self.call(argc)? {
+                    return Ok(StepOutcome::HostCall(request));
+                }
+            }
             Instruction::CallNamed { name, .. } => {
                 let name = self.constant_string(function_id, name)?;
                 return Err(self.error(
@@ -326,7 +441,7 @@ impl Vm {
                 self.exceptions
                     .retain(|exception| exception.frame_depth < self.frames.len());
                 if self.frames.is_empty() {
-                    return Ok(Some(value));
+                    return Ok(StepOutcome::Completed(value));
                 }
                 self.push(value)?;
             }
@@ -427,15 +542,25 @@ impl Vm {
                 }
             }
             Instruction::Await => {
-                return Err(self.error(
-                    RuntimeErrorKind::HostError,
-                    "await requires the asynchronous scheduler",
-                ));
+                let value = self.pop()?;
+                let Value::Future(operation) = value else {
+                    return Err(self.error(
+                        RuntimeErrorKind::TypeError,
+                        format!("await requires a future, got {}", value.type_name()),
+                    ));
+                };
+                return Ok(StepOutcome::Waiting(operation));
             }
-            Instruction::ExecuteCommand(_) => self.push(Value::Null)?,
+            Instruction::ExecuteCommand(id) => {
+                let command = self.constant_command(function_id, id)?;
+                return Ok(StepOutcome::CommandCall(CommandRequest {
+                    command,
+                    context: self.host_context.clone(),
+                }));
+            }
             Instruction::EmitEvent(_) => self.push(Value::Null)?,
         }
-        Ok(None)
+        Ok(StepOutcome::Continue)
     }
 
     fn dispatch_catchable_error(&mut self, error: &RuntimeError) -> RuntimeResult<bool> {
@@ -469,7 +594,7 @@ impl Vm {
         Ok(true)
     }
 
-    fn call(&mut self, argc: u16) -> RuntimeResult<()> {
+    fn call(&mut self, argc: u16) -> RuntimeResult<Option<HostRequest>> {
         if self.frames.len() >= self.limits.max_call_depth {
             return Err(self.error(
                 RuntimeErrorKind::ResourceLimit,
@@ -484,7 +609,16 @@ impl Vm {
                 error.stack_trace = self.stack_trace().into_boxed_slice();
                 error
             })?;
-            return self.push(result);
+            self.push(result)?;
+            return Ok(None);
+        }
+        if let Value::HostFunction(name) = callee {
+            return Ok(Some(HostRequest {
+                target: HostTarget::Global,
+                function: name.to_string(),
+                arguments,
+                context: self.host_context.clone(),
+            }));
         }
         let Value::Closure(closure) = callee else {
             return Err(self.error(
@@ -519,7 +653,7 @@ impl Vm {
             closure: Some(closure),
             iterators: Vec::new(),
         });
-        Ok(())
+        Ok(None)
     }
 
     fn unary(&self, operator: UnaryOperator, value: Value) -> RuntimeResult<Value> {
@@ -658,8 +792,23 @@ impl Vm {
                 function: *function,
                 captures: Vec::new(),
             }))),
+            Constant::Command(_) => Err(self.error(
+                RuntimeErrorKind::Internal,
+                "command constant used as a value",
+            )),
         }
     }
+    fn constant_command(
+        &self,
+        function: FunctionId,
+        id: ConstantId,
+    ) -> RuntimeResult<crate::ast::ExCommand> {
+        match self.prototype(function)?.constants.get(id.0 as usize) {
+            Some(Constant::Command(command)) => Ok((**command).clone()),
+            _ => Err(self.error(RuntimeErrorKind::Internal, "constant is not a command")),
+        }
+    }
+
     fn constant_string(&self, function: FunctionId, id: ConstantId) -> RuntimeResult<String> {
         match self.prototype(function)?.constants.get(id.0 as usize) {
             Some(Constant::String(value)) => Ok(value.clone()),
@@ -816,6 +965,7 @@ fn identity(left: &Value, right: &Value) -> bool {
     match (left, right) {
         (Value::Closure(left), Value::Closure(right)) => Arc::ptr_eq(left, right),
         (Value::Builtin(left), Value::Builtin(right)) => left == right,
+        (Value::HostFunction(left), Value::HostFunction(right)) => left == right,
         (Value::HostObject(left), Value::HostObject(right)) => left == right,
         _ => left == right,
     }
@@ -855,19 +1005,6 @@ fn bare_error(kind: RuntimeErrorKind, message: impl Into<String>) -> RuntimeErro
     }
 }
 
-#[derive(Clone, Debug)]
-pub struct Task {
-    pub id: TaskId,
-    pub vm: Vm,
-    pub parent: Option<TaskId>,
-    pub cancellation_requested: bool,
-}
-#[derive(Clone, Debug, Default)]
-pub struct Scheduler {
-    pub tasks: HashMap<TaskId, Task>,
-    pub ready_queue: Vec<TaskId>,
-    pub next_task_id: u64,
-}
 #[derive(Clone, Debug)]
 pub struct ResourceLimits {
     pub max_instructions: Option<u64>,

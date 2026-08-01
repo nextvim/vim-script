@@ -3,30 +3,43 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use crate::runtime::{HostObjectId, RuntimeResult, Value};
+use crate::ast::ExCommand;
+use crate::runtime::{HostObjectId, RuntimeError, RuntimeErrorKind, RuntimeResult, Value, Vm};
 
-pub type HostFuture<'a> = Pin<Box<dyn Future<Output = RuntimeResult<Value>> + Send + 'a>>;
+pub type HostFuture = Pin<Box<dyn Future<Output = RuntimeResult<Value>> + Send + 'static>>;
 
-pub trait Host: Send {
-    fn call<'a>(&'a mut self, call: HostCall<'a>) -> HostFuture<'a>;
+/// Application boundary for asynchronous operations. Requests own all data so
+/// returned futures can outlive a VM quantum and move to an I/O executor.
+pub trait Host: Send + Sync + 'static {
+    fn call(&self, request: HostRequest) -> HostFuture;
+
+    fn execute_command(&self, request: CommandRequest) -> HostFuture {
+        Box::pin(async move {
+            Err(RuntimeError::coded(
+                "E492",
+                RuntimeErrorKind::InvalidCommand,
+                format!("host does not implement command {}", request.command.name),
+            ))
+        })
+    }
 }
 
-#[derive(Clone, Debug)]
-pub struct HostCall<'a> {
-    pub target: HostTarget<'a>,
-    pub function: &'a str,
-    pub arguments: &'a [Value],
+#[derive(Clone, Debug, PartialEq)]
+pub struct HostRequest {
+    pub target: HostTarget,
+    pub function: String,
+    pub arguments: Vec<Value>,
     pub context: HostContext,
 }
 
-#[derive(Clone, Copy, Debug)]
-pub enum HostTarget<'a> {
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum HostTarget {
     Global,
-    Namespace(&'a str),
+    Namespace(String),
     Object(HostObjectId),
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct HostContext {
     pub script_name: Option<String>,
     pub current_buffer: Option<u64>,
@@ -61,17 +74,25 @@ impl CapabilitySet {
     pub fn allows(&self, capability: &Capability) -> bool {
         self.granted.contains(capability)
     }
+    pub fn grant(&mut self, capability: Capability) -> bool {
+        self.granted.insert(capability)
+    }
+    pub fn revoke(&mut self, capability: &Capability) -> bool {
+        self.granted.remove(capability)
+    }
+    pub fn allows_all(&self, capabilities: &[Capability]) -> bool {
+        capabilities
+            .iter()
+            .all(|capability| self.allows(capability))
+    }
 }
 
-pub type NativeFuture = Pin<Box<dyn Future<Output = RuntimeResult<Value>> + Send + 'static>>;
-pub type NativeFunction = Arc<dyn Fn(Vec<Value>) -> NativeFuture + Send + Sync>;
-
-#[derive(Clone)]
-pub struct FunctionRegistration {
-    pub name: String,
-    pub function: NativeFunction,
-    pub arity: Arity,
-    pub required_capabilities: Vec<Capability>,
+impl<const N: usize> From<[Capability; N]> for CapabilitySet {
+    fn from(capabilities: [Capability; N]) -> Self {
+        Self {
+            granted: capabilities.into_iter().collect(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -81,32 +102,211 @@ pub enum Arity {
     Variadic { min: u16 },
 }
 
-#[derive(Clone, Default)]
-pub struct FunctionRegistry {
-    pub functions: HashMap<String, FunctionRegistration>,
+impl Arity {
+    pub fn accepts(self, count: usize) -> bool {
+        match self {
+            Self::Exact(expected) => count == expected as usize,
+            Self::Range { min, max } => (min as usize..=max as usize).contains(&count),
+            Self::Variadic { min } => count >= min as usize,
+        }
+    }
 }
-
-pub type CommandFuture = Pin<Box<dyn Future<Output = RuntimeResult<Value>> + Send + 'static>>;
-pub type CommandHandler = Arc<dyn Fn(CommandInvocation) -> CommandFuture + Send + Sync>;
 
 #[derive(Clone, Debug)]
-pub struct CommandInvocation {
+pub struct HostFunctionRegistration {
     pub name: String,
-    pub bang: bool,
-    pub arguments: String,
-    pub range: Option<(i64, i64)>,
-    pub count: Option<u64>,
-    pub register: Option<char>,
-}
-
-#[derive(Clone)]
-pub struct CommandRegistration {
-    pub name: String,
-    pub handler: CommandHandler,
+    pub target: HostTarget,
+    pub arity: Arity,
     pub required_capabilities: Vec<Capability>,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Debug, Default)]
+pub struct HostFunctionRegistry {
+    pub functions: HashMap<String, HostFunctionRegistration>,
+}
+
+impl HostFunctionRegistry {
+    pub fn register(&mut self, registration: HostFunctionRegistration) {
+        self.functions
+            .insert(registration.name.clone(), registration);
+    }
+    pub fn names(&self) -> impl Iterator<Item = &str> {
+        self.functions.keys().map(String::as_str)
+    }
+    pub fn get(&self, name: &str) -> Option<&HostFunctionRegistration> {
+        self.functions.get(name)
+    }
+}
+
+#[derive(Clone)]
+pub struct HostRuntime {
+    pub host: Arc<dyn Host>,
+    pub capabilities: CapabilitySet,
+    pub functions: HostFunctionRegistry,
+    pub commands: CommandRegistry,
+}
+
+impl std::fmt::Debug for HostRuntime {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("HostRuntime")
+            .field("capabilities", &self.capabilities)
+            .field("functions", &self.functions)
+            .field("commands", &self.commands)
+            .finish_non_exhaustive()
+    }
+}
+
+impl HostRuntime {
+    pub fn new(host: Arc<dyn Host>) -> Self {
+        Self {
+            host,
+            capabilities: CapabilitySet::default(),
+            functions: HostFunctionRegistry::default(),
+            commands: CommandRegistry::default(),
+        }
+    }
+
+    pub fn register_function(
+        &mut self,
+        name: impl Into<String>,
+        arity: Arity,
+        required_capabilities: Vec<Capability>,
+    ) {
+        let name = name.into();
+        self.functions.register(HostFunctionRegistration {
+            name: name.clone(),
+            target: HostTarget::Global,
+            arity,
+            required_capabilities,
+        });
+    }
+
+    pub fn register_command(&mut self, definition: CommandDefinition) {
+        self.commands.register(definition);
+    }
+
+    pub fn install_globals(&self, vm: &mut Vm) {
+        for name in self.functions.names() {
+            let function = Value::HostFunction(Arc::from(name));
+            vm.globals.insert(format!(":{name}"), function.clone());
+            vm.globals.insert(format!("g:{name}"), function);
+        }
+    }
+
+    pub fn dispatch(&self, mut request: HostRequest) -> RuntimeResult<HostFuture> {
+        let registration = self.functions.get(&request.function).ok_or_else(|| {
+            RuntimeError::coded(
+                "E117",
+                RuntimeErrorKind::NameError,
+                format!("unknown host function: {}", request.function),
+            )
+        })?;
+        if !registration.arity.accepts(request.arguments.len()) {
+            return Err(RuntimeError::coded(
+                "E119",
+                RuntimeErrorKind::ArityError,
+                format!("invalid argument count for {}", request.function),
+            ));
+        }
+        if let Some(missing) = registration
+            .required_capabilities
+            .iter()
+            .find(|capability| !self.capabilities.allows(capability))
+        {
+            return Err(RuntimeError::coded(
+                "E_PERM",
+                RuntimeErrorKind::PermissionDenied,
+                format!(
+                    "host function {} requires capability {missing:?}",
+                    request.function
+                ),
+            ));
+        }
+        request.target = registration.target.clone();
+        Ok(self.host.call(request))
+    }
+
+    pub fn dispatch_command(&self, mut request: CommandRequest) -> RuntimeResult<HostFuture> {
+        let definition = self.commands.resolve(&request.command.name)?;
+        request.command.name = definition.name.clone();
+        if request.command.bang && !definition.accepts_bang {
+            return Err(RuntimeError::coded(
+                "E477",
+                RuntimeErrorKind::InvalidCommand,
+                format!("{} does not accept !", definition.name),
+            ));
+        }
+        if request.command.range.is_some() && !definition.accepts_range {
+            return Err(RuntimeError::coded(
+                "E481",
+                RuntimeErrorKind::InvalidCommand,
+                format!("{} does not accept a range", definition.name),
+            ));
+        }
+        if !self
+            .capabilities
+            .allows_all(&definition.required_capabilities)
+        {
+            return Err(RuntimeError::coded(
+                "E_PERM",
+                RuntimeErrorKind::PermissionDenied,
+                format!("command {} lacks required capabilities", definition.name),
+            ));
+        }
+        Ok(self.host.execute_command(request))
+    }
+}
+
+pub type CommandFuture = HostFuture;
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct CommandRequest {
+    pub command: ExCommand,
+    pub context: HostContext,
+}
+
+#[derive(Clone, Debug)]
+pub struct CommandDefinition {
+    pub name: String,
+    pub minimum_abbreviation: usize,
+    pub accepts_bang: bool,
+    pub accepts_range: bool,
+    pub accepts_count: bool,
+    pub accepts_register: bool,
+    pub required_capabilities: Vec<Capability>,
+}
+
+#[derive(Clone, Debug, Default)]
 pub struct CommandRegistry {
-    pub commands: HashMap<String, CommandRegistration>,
+    pub commands: HashMap<String, CommandDefinition>,
+}
+
+impl CommandRegistry {
+    pub fn register(&mut self, definition: CommandDefinition) {
+        self.commands.insert(definition.name.clone(), definition);
+    }
+    pub fn resolve(&self, name: &str) -> RuntimeResult<&CommandDefinition> {
+        if let Some(command) = self.commands.get(name) {
+            return Ok(command);
+        }
+        let mut matches = self.commands.values().filter(|command| {
+            name.len() >= command.minimum_abbreviation && command.name.starts_with(name)
+        });
+        let Some(command) = matches.next() else {
+            return Err(RuntimeError::coded(
+                "E492",
+                RuntimeErrorKind::InvalidCommand,
+                format!("not an editor command: {name}"),
+            ));
+        };
+        if matches.next().is_some() {
+            return Err(RuntimeError::coded(
+                "E464",
+                RuntimeErrorKind::InvalidCommand,
+                format!("ambiguous command: {name}"),
+            ));
+        }
+        Ok(command)
+    }
 }

@@ -172,12 +172,7 @@ impl<'a> Compiler<'a> {
                 self.emit(Instruction::Return, stmt.span);
             }
             StmtKind::ExCommand(command) => {
-                let text = if command.arguments.is_empty() {
-                    command.name.clone()
-                } else {
-                    format!("{} {}", command.name, command.arguments)
-                };
-                let constant = self.constant(Constant::String(text));
+                let constant = self.constant(Constant::Command(Box::new(command.clone())));
                 self.emit(Instruction::ExecuteCommand(constant), stmt.span);
                 self.emit(Instruction::Pop, stmt.span);
             }
@@ -588,7 +583,7 @@ impl<'a> Compiler<'a> {
         } else if self.is_current_local(symbol) {
             Instruction::LoadLocal(symbol.slot)
         } else {
-            let name = self.constant(Constant::String(symbol_runtime_name(symbol)));
+            let name = self.constant(Constant::String(self.symbol_runtime_name(symbol)));
             Instruction::LoadGlobal(name)
         };
         self.emit(instruction, span);
@@ -600,11 +595,26 @@ impl<'a> Compiler<'a> {
         } else if self.is_current_local(symbol) {
             Instruction::StoreLocal(symbol.slot)
         } else {
-            let name = self.constant(Constant::String(symbol_runtime_name(symbol)));
+            let name = self.constant(Constant::String(self.symbol_runtime_name(symbol)));
             Instruction::StoreGlobal(name)
         };
         self.emit(instruction, span);
     }
+    fn symbol_runtime_name(&self, symbol: &Symbol) -> String {
+        let prefix = match symbol.namespace {
+            Scope::Global => "g".to_owned(),
+            Scope::Local => "l".to_owned(),
+            Scope::Script => format!("s{}", self.program.program.source.0),
+            Scope::Argument => "a".to_owned(),
+            Scope::Buffer => "b".to_owned(),
+            Scope::Window => "w".to_owned(),
+            Scope::Tab => "t".to_owned(),
+            Scope::Vim => "v".to_owned(),
+            Scope::Unqualified => String::new(),
+        };
+        format!("{prefix}:{}", symbol.name)
+    }
+
     fn capture_slot(&self, id: SymbolId) -> Option<u32> {
         self.current_resolved().and_then(|function| {
             function
@@ -734,23 +744,7 @@ fn literal_constant(literal: &Literal) -> Constant {
         Literal::Blob(value) => Constant::Blob(value.clone()),
     }
 }
-fn symbol_runtime_name(symbol: &Symbol) -> String {
-    format!(
-        "{}:{}",
-        match symbol.namespace {
-            Scope::Global => "g",
-            Scope::Local => "l",
-            Scope::Script => "s",
-            Scope::Argument => "a",
-            Scope::Buffer => "b",
-            Scope::Window => "w",
-            Scope::Tab => "t",
-            Scope::Vim => "v",
-            Scope::Unqualified => "",
-        },
-        symbol.name
-    )
-}
+
 fn display_scoped(name: &ScopedName) -> String {
     if name.scope == Scope::Unqualified {
         name.name.clone()

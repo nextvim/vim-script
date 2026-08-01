@@ -7,6 +7,9 @@ use crate::resolver::FunctionId;
 pub struct TaskId(pub u64);
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct OperationId(pub u64);
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct HostObjectId(pub u64);
 
 #[derive(Clone, Debug)]
@@ -27,7 +30,8 @@ pub enum Value {
     Dictionary(BTreeMap<String, Value>),
     Closure(Arc<Closure>),
     Builtin(Arc<str>),
-    Future(TaskId),
+    HostFunction(Arc<str>),
+    Future(OperationId),
     HostObject(HostObjectId),
 }
 
@@ -46,6 +50,7 @@ impl PartialEq for Value {
             (Self::Dictionary(left), Self::Dictionary(right)) => left == right,
             (Self::Closure(left), Self::Closure(right)) => Arc::ptr_eq(left, right),
             (Self::Builtin(left), Self::Builtin(right)) => left == right,
+            (Self::HostFunction(left), Self::HostFunction(right)) => left == right,
             (Self::Future(left), Self::Future(right)) => left == right,
             (Self::HostObject(left), Self::HostObject(right)) => left == right,
             _ => false,
@@ -64,7 +69,11 @@ impl Value {
             Self::Blob(value) => !value.is_empty(),
             Self::List(value) => !value.is_empty(),
             Self::Dictionary(value) => !value.is_empty(),
-            Self::Closure(_) | Self::Builtin(_) | Self::Future(_) | Self::HostObject(_) => true,
+            Self::Closure(_)
+            | Self::Builtin(_)
+            | Self::HostFunction(_)
+            | Self::Future(_)
+            | Self::HostObject(_) => true,
         }
     }
 
@@ -78,7 +87,7 @@ impl Value {
             Self::Blob(_) => "blob",
             Self::List(_) => "list",
             Self::Dictionary(_) => "dictionary",
-            Self::Closure(_) | Self::Builtin(_) => "function",
+            Self::Closure(_) | Self::Builtin(_) | Self::HostFunction(_) => "function",
             Self::Future(_) => "future",
             Self::HostObject(_) => "object",
         }

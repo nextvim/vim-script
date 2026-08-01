@@ -121,7 +121,7 @@ fn value_type(args: &[Value]) -> RuntimeResult<Value> {
     let code = match args[0] {
         Value::Integer(_) => 0,
         Value::String(_) => 1,
-        Value::Closure(_) | Value::Builtin(_) => 2,
+        Value::Closure(_) | Value::Builtin(_) | Value::HostFunction(_) => 2,
         Value::List(_) => 3,
         Value::Dictionary(_) => 4,
         Value::Float(_) => 5,
@@ -400,7 +400,7 @@ fn vim_string(value: &Value) -> String {
                 .join(", ")
         ),
         Value::Closure(_) => "function('<lambda>')".into(),
-        Value::Builtin(name) => format!("function('{name}')"),
+        Value::Builtin(name) | Value::HostFunction(name) => format!("function('{name}')"),
         Value::Future(id) => format!("future({})", id.0),
         Value::HostObject(id) => format!("object({})", id.0),
     }

@@ -295,7 +295,7 @@ pub enum OptionScope {
     Unqualified,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ExCommand {
     pub modifiers: Vec<CommandModifier>,
     pub range: Option<CommandRange>,
@@ -306,7 +306,7 @@ pub struct ExCommand {
     pub arguments: String,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum CommandModifier {
     Silent { errors: bool },
     KeepJumps,
@@ -319,14 +319,14 @@ pub enum CommandModifier {
     Tab(Option<u32>),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct CommandRange {
     pub start: Address,
     pub end: Option<Address>,
     pub separator: Option<RangeSeparator>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Address {
     Current,
     Last,
