@@ -81,13 +81,13 @@ The initial implementation sequence is complete:
 
 Development now proceeds through compatibility-driven slices based on conventional plugin structure and real plugin failures:
 
-1. Module-owned function references
-2. Automatic autoload
-3. `exists()` and plugin load guards
-4. Source-preserving Ex parser
-5. User commands
-6. Mappings and autocommands
-7. First realistic plugin fixture
+1. ~~Module-owned function references~~ — complete
+2. ~~Automatic autoload~~ — complete
+3. ~~`exists()` and plugin load guards~~ — complete
+4. ~~Source-preserving Ex parser~~ — complete
+5. ~~User commands~~ — complete
+6. ~~Mappings and autocommands~~ — complete
+7. ~~First realistic plugin fixture (upstream Vim `desert` colorscheme)~~ — complete
 8. Select and support a small external plugin
 
 Each slice should add focused regression and plugin-level integration tests. Compatibility gaps should be reported structurally rather than causing crashes, and host-facing behavior should remain asynchronous and capability-controlled.

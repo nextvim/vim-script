@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use crate::ast::{MapMode, MappingOptions};
+use crate::ast::{ExCommand, MapMode, MappingOptions};
 use crate::bytecode::BytecodeModule;
 use crate::runtime::{RuntimeError, RuntimeErrorKind, RuntimeResult, Value};
 
@@ -20,9 +20,15 @@ pub struct EventHandler {
     pub group: Option<String>,
     pub event: String,
     pub patterns: Vec<String>,
-    pub module: BytecodeModule,
+    pub action: EventAction,
     pub once: bool,
     pub nested: bool,
+}
+
+#[derive(Clone, Debug)]
+pub enum EventAction {
+    Bytecode(BytecodeModule),
+    Command(ExCommand),
 }
 
 #[derive(Clone, Debug, Default)]
@@ -439,7 +445,7 @@ mod tests {
             group: group.map(str::to_owned),
             event: "BufWrite".into(),
             patterns: vec![pattern.into()],
-            module: module(),
+            action: EventAction::Bytecode(module()),
             once,
             nested: false,
         }

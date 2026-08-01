@@ -355,6 +355,7 @@ pub struct UserCommandAttributes {
     pub nargs: Option<String>,
     pub complete: Option<String>,
     pub range: bool,
+    pub count: bool,
     pub bang: bool,
     pub bar: bool,
     pub register: bool,

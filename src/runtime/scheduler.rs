@@ -297,26 +297,56 @@ impl Scheduler {
                 self.resume_host_call(id, result)?;
             }
             Ok(VmRunOutcome::CommandCall(request)) => {
-                let dispatched = self
-                    .host
-                    .as_ref()
-                    .ok_or_else(|| {
-                        RuntimeError::coded(
-                            "E_HOST",
-                            RuntimeErrorKind::HostError,
-                            "no host runtime is configured",
-                        )
-                    })
-                    .and_then(|host| host.dispatch_command(request));
-                match dispatched {
-                    Ok(future) => {
-                        let operation = self.register_boxed(future);
-                        let task = self.tasks.get_mut(&id).expect("task exists");
-                        task.vm.suspend_for_operation(operation);
-                        task.state = TaskState::Waiting(operation);
-                        self.waiting.insert(operation, id);
+                if request.command.name == "command" {
+                    let result = self
+                        .host
+                        .as_mut()
+                        .ok_or_else(|| {
+                            RuntimeError::coded(
+                                "E_HOST",
+                                RuntimeErrorKind::HostError,
+                                "no host runtime is configured",
+                            )
+                        })
+                        .and_then(|host| host.define_user_command(&request.command))
+                        .map(|()| Value::Null);
+                    self.complete_command(id, result)?;
+                } else {
+                    let registration = self
+                        .host
+                        .as_mut()
+                        .and_then(|host| host.handle_registration_command(&request));
+                    if let Some(result) = registration {
+                        self.complete_command(id, result.map(|()| Value::Null))?;
+                    } else {
+                        let dispatched = self
+                            .host
+                            .as_ref()
+                            .ok_or_else(|| {
+                                RuntimeError::coded(
+                                    "E_HOST",
+                                    RuntimeErrorKind::HostError,
+                                    "no host runtime is configured",
+                                )
+                            })
+                            .and_then(|host| host.prepare_command(request))
+                            .and_then(|request| {
+                                self.host
+                                    .as_ref()
+                                    .expect("host checked")
+                                    .dispatch_command(request)
+                            });
+                        match dispatched {
+                            Ok(future) => {
+                                let operation = self.register_boxed(future);
+                                let task = self.tasks.get_mut(&id).expect("task exists");
+                                task.vm.suspend_for_operation(operation);
+                                task.state = TaskState::Waiting(operation);
+                                self.waiting.insert(operation, id);
+                            }
+                            Err(error) => self.complete_command(id, Err(error))?,
+                        }
                     }
-                    Err(error) => self.resume_host_call(id, Err(error))?,
                 }
             }
             Ok(VmRunOutcome::Waiting(operation)) => {
@@ -369,6 +399,24 @@ impl Scheduler {
             }
         }
         Ok(true)
+    }
+
+    fn complete_command(&mut self, id: TaskId, result: RuntimeResult<Value>) -> RuntimeResult<()> {
+        let task = self.tasks.get_mut(&id).ok_or_else(|| {
+            RuntimeError::coded(
+                "E900",
+                RuntimeErrorKind::Internal,
+                "command task disappeared",
+            )
+        })?;
+        match task.vm.complete_command(result) {
+            Ok(()) => {
+                task.state = TaskState::Ready;
+                self.ready_queue.push_back(id);
+            }
+            Err(error) => task.state = TaskState::Failed(error),
+        }
+        Ok(())
     }
 
     fn resume_host_call(

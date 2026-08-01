@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::bytecode::{BytecodeModule, Constant, Instruction};
 use crate::compiler::Compiler;
 use crate::host::HostRuntime;
 use crate::lexer::Lexer;
@@ -35,6 +36,13 @@ impl RuntimePath {
         }
         paths.sort();
         paths
+    }
+
+    pub fn colorscheme(&self, name: &str) -> Option<PathBuf> {
+        self.roots
+            .iter()
+            .map(|root| root.join("colors").join(format!("{name}.vim")))
+            .find(|path| path.is_file())
     }
 
     pub fn autoload_files(&self) -> Vec<PathBuf> {
@@ -121,7 +129,7 @@ impl ScriptLoader {
             sources: SourceMap::default(),
             loaded_scripts: HashMap::new(),
             autoload_index: HashMap::new(),
-            globals: HashMap::new(),
+            globals: HashMap::from([("v:version".into(), Value::Integer(900))]),
             host: None,
             instruction_quantum: 10_000,
         };
@@ -151,6 +159,20 @@ impl ScriptLoader {
             .max_by_key(|(prefix, _)| prefix.len())
             .map(|(_, path)| path.clone())
             .or_else(|| self.runtime_path.find_autoload(function))
+    }
+
+    pub fn load_colorscheme(&mut self, name: &str) -> Result<PathBuf, CompatibilityFailure> {
+        let path = self
+            .runtime_path
+            .colorscheme(name)
+            .ok_or_else(|| CompatibilityFailure {
+                path: None,
+                stage: CompatibilityStage::Discovery,
+                message: format!("colorscheme not found: {name}"),
+                diagnostics: Vec::new(),
+            })?;
+        self.load_script(&path)?;
+        Ok(path)
     }
 
     pub fn load_startup_plugins(&mut self) -> CompatibilityReport {
@@ -197,7 +219,7 @@ impl ScriptLoader {
                 lexed.diagnostics,
             ));
         }
-        let parsed = Parser::new(&lexed.tokens).parse();
+        let parsed = Parser::new_with_source(&lexed.tokens, &text).parse();
         if !parsed.diagnostics.is_empty() {
             return Err(failure(
                 &canonical,
@@ -232,11 +254,24 @@ impl ScriptLoader {
                 compiled.diagnostics,
             ));
         }
-        let vm = Vm::with_globals(
-            compiled.module.expect("compiler always returns a module"),
-            self.globals.clone(),
-        )
-        .map_err(|error| runtime_failure(&canonical, error))?;
+        let module = compiled.module.expect("compiler always returns a module");
+        for function in autoload_references(&module) {
+            let runtime_name = format!(":{function}");
+            if matches!(self.globals.get(&runtime_name), Some(Value::Closure(_))) {
+                continue;
+            }
+            let autoload = self.autoload_for(&function).ok_or_else(|| {
+                failure(
+                    &canonical,
+                    CompatibilityStage::Discovery,
+                    format!("no autoload script found for function {function}"),
+                    Vec::new(),
+                )
+            })?;
+            self.load_script(&autoload)?;
+        }
+        let vm = Vm::with_globals(module, self.globals.clone())
+            .map_err(|error| runtime_failure(&canonical, error))?;
         let mut scheduler = Scheduler::new(self.instruction_quantum);
         if let Some(host) = self.host.clone() {
             scheduler.set_host(host);
@@ -247,6 +282,9 @@ impl ScriptLoader {
         scheduler
             .run_until_complete(task)
             .map_err(|error| runtime_failure(&canonical, error))?;
+        if let Some(host) = scheduler.host().cloned() {
+            self.host = Some(host);
+        }
         self.globals = scheduler
             .task(task)
             .expect("completed task exists")
@@ -263,6 +301,28 @@ impl ScriptLoader {
         );
         Ok(())
     }
+}
+
+fn autoload_references(module: &BytecodeModule) -> Vec<String> {
+    let mut references = HashSet::new();
+    for function in &module.functions {
+        for instruction in &function.code {
+            let Instruction::LoadGlobal(id) = instruction else {
+                continue;
+            };
+            let Some(Constant::String(name)) = function.constants.get(id.0 as usize) else {
+                continue;
+            };
+            if let Some(name) = name.strip_prefix(':')
+                && name.contains('#')
+            {
+                references.insert(name.to_owned());
+            }
+        }
+    }
+    let mut references: Vec<_> = references.into_iter().collect();
+    references.sort();
+    references
 }
 
 fn collect_vim_files(directory: &Path, recursive: bool, output: &mut Vec<PathBuf>) {

@@ -6,6 +6,7 @@
 pub mod ast;
 pub mod bytecode;
 pub mod compiler;
+pub mod ex_parser;
 pub mod host;
 pub mod integration;
 pub mod lexer;

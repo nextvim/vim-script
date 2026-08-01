@@ -644,7 +644,7 @@ impl<'a> Lexer<'a> {
 }
 
 fn is_identifier_start(ch: char) -> bool {
-    ch == '_' || ch.is_alphabetic()
+    ch == '_' || ch == '#' || ch.is_alphabetic()
 }
 fn is_identifier_continue(ch: char) -> bool {
     ch == '_' || ch == '#' || ch.is_alphanumeric()

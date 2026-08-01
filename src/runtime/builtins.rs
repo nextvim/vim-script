@@ -46,6 +46,7 @@ impl BuiltinRegistry {
         registry.register("abs", BuiltinArity::Exact(1), abs);
         registry.register("add", BuiltinArity::Exact(2), add);
         registry.register("empty", BuiltinArity::Exact(1), empty);
+        registry.register("exists", BuiltinArity::Exact(1), exists_without_vm_context);
         registry.register("get", BuiltinArity::Range { min: 2, max: 3 }, get);
         registry.register("join", BuiltinArity::Range { min: 1, max: 2 }, join);
         registry.register("len", BuiltinArity::Exact(1), len);
@@ -116,6 +117,14 @@ fn len(args: &[Value]) -> RuntimeResult<Value> {
 }
 fn empty(args: &[Value]) -> RuntimeResult<Value> {
     Ok(Value::Bool(!args[0].is_truthy()))
+}
+
+fn exists_without_vm_context(args: &[Value]) -> RuntimeResult<Value> {
+    if !matches!(args[0], Value::String(_)) {
+        return Err(type_error("exists", "String", &args[0]));
+    }
+    // The VM intercepts exists() to inspect live runtime namespaces.
+    Ok(Value::Integer(0))
 }
 fn value_type(args: &[Value]) -> RuntimeResult<Value> {
     let code = match args[0] {

@@ -5,7 +5,7 @@ use crate::ast::{BinaryOperator, UnaryOperator};
 use crate::bytecode::{BytecodeModule, Constant, ConstantId, FunctionPrototype, Instruction};
 use crate::host::{CommandRequest, HostContext, HostRequest, HostTarget};
 use crate::resolver::FunctionId;
-use crate::runtime::{BuiltinRegistry, Closure, OperationId, Value};
+use crate::runtime::{BuiltinRegistry, Closure, FunctionRef, OperationId, Value};
 use crate::source::Span;
 
 #[derive(Clone, Debug)]
@@ -16,6 +16,7 @@ pub struct IteratorState {
 
 #[derive(Clone, Debug)]
 pub struct CallFrame {
+    pub module: Arc<BytecodeModule>,
     pub function: FunctionId,
     pub instruction_pointer: u32,
     pub stack_base: usize,
@@ -140,6 +141,7 @@ impl Vm {
         })?;
         let limits = ResourceLimits::default();
         let frame = CallFrame {
+            module: module.clone(),
             function: entrypoint,
             instruction_pointer: 0,
             stack_base: 0,
@@ -242,6 +244,19 @@ impl Vm {
         };
     }
 
+    pub fn complete_command(&mut self, result: RuntimeResult<Value>) -> RuntimeResult<()> {
+        match result {
+            Ok(value) => self.push(value)?,
+            Err(error) if self.dispatch_catchable_error(&error)? => {}
+            Err(error) => {
+                self.status = VmStatus::Failed(error.clone());
+                return Err(error);
+            }
+        }
+        self.status = VmStatus::Ready;
+        Ok(())
+    }
+
     pub fn resume_host_call(&mut self, result: RuntimeResult<OperationId>) -> RuntimeResult<()> {
         match result {
             Ok(operation) => self.push(Value::Future(operation))?,
@@ -284,15 +299,19 @@ impl Vm {
             }
             *budget -= 1;
         }
-        let (function_id, ip) = {
+        let (module, function_id, ip) = {
             let frame = self
                 .frames
                 .last()
                 .ok_or_else(|| bare_error(RuntimeErrorKind::Internal, "VM has no call frame"))?;
-            (frame.function, frame.instruction_pointer)
+            (
+                frame.module.clone(),
+                frame.function,
+                frame.instruction_pointer,
+            )
         };
         let instruction = self
-            .prototype(function_id)?
+            .prototype(&module, function_id)?
             .code
             .get(ip as usize)
             .cloned()
@@ -308,7 +327,7 @@ impl Vm {
             .instruction_pointer += 1;
         match instruction {
             Instruction::LoadConstant(id) => {
-                let value = self.constant_value(function_id, id)?;
+                let value = self.constant_value(&module, function_id, id)?;
                 self.push(value)?;
             }
             Instruction::LoadNull => self.push(Value::Null)?,
@@ -351,9 +370,11 @@ impl Vm {
                 ));
             }
             Instruction::LoadGlobal(id) | Instruction::LoadScoped { name: id, .. } => {
-                let name = self.constant_string(function_id, id)?;
+                let name = self.constant_string(&module, function_id, id)?;
                 let value = if let Some(value) = self.globals.get(&name).cloned() {
                     value
+                } else if name.ends_with(':') {
+                    self.namespace_dictionary(&name)
                 } else {
                     let builtin_name = name.strip_prefix(':').unwrap_or(&name);
                     if self.builtins.contains(builtin_name) {
@@ -368,7 +389,7 @@ impl Vm {
                 self.push(value)?;
             }
             Instruction::StoreGlobal(id) | Instruction::StoreScoped { name: id, .. } => {
-                let name = self.constant_string(function_id, id)?;
+                let name = self.constant_string(&module, function_id, id)?;
                 let value = self.pop()?;
                 self.globals.insert(name, value);
             }
@@ -417,7 +438,7 @@ impl Vm {
                 ));
             }
             Instruction::GetMember(id) => {
-                let name = self.constant_string(function_id, id)?;
+                let name = self.constant_string(&module, function_id, id)?;
                 let target = self.pop()?;
                 let value = self.get_index(target, Value::String(Arc::from(name)))?;
                 self.push(value)?;
@@ -428,7 +449,7 @@ impl Vm {
                 }
             }
             Instruction::CallNamed { name, .. } => {
-                let name = self.constant_string(function_id, name)?;
+                let name = self.constant_string(&module, function_id, name)?;
                 return Err(self.error(
                     RuntimeErrorKind::NameError,
                     format!("native function {name} is not registered in the synchronous core"),
@@ -448,7 +469,10 @@ impl Vm {
             Instruction::MakeClosure { function, captures } => {
                 let values = self.pop_many(captures as usize)?;
                 self.push(Value::Closure(Arc::new(Closure {
-                    function,
+                    function: FunctionRef {
+                        module: module.clone(),
+                        function,
+                    },
                     captures: values,
                 })))?;
             }
@@ -552,7 +576,7 @@ impl Vm {
                 return Ok(StepOutcome::Waiting(operation));
             }
             Instruction::ExecuteCommand(id) => {
-                let command = self.constant_command(function_id, id)?;
+                let command = self.constant_command(&module, function_id, id)?;
                 return Ok(StepOutcome::CommandCall(CommandRequest {
                     command,
                     context: self.host_context.clone(),
@@ -604,7 +628,12 @@ impl Vm {
         let arguments = self.pop_many(argc as usize)?;
         let callee = self.pop()?;
         if let Value::Builtin(name) = &callee {
-            let result = self.builtins.call(name, &arguments).map_err(|mut error| {
+            let result = if name.as_ref() == "exists" {
+                self.builtin_exists(&arguments)
+            } else {
+                self.builtins.call(name, &arguments)
+            }
+            .map_err(|mut error| {
                 error.span = self.current_span();
                 error.stack_trace = self.stack_trace().into_boxed_slice();
                 error
@@ -626,7 +655,8 @@ impl Vm {
                 format!("{} is not callable", callee.type_name()),
             ));
         };
-        let prototype = self.prototype(closure.function)?;
+        let function = closure.function.clone();
+        let prototype = self.prototype(&function.module, function.function)?;
         let required = prototype
             .arity
             .saturating_sub(prototype.optional_parameters);
@@ -646,7 +676,8 @@ impl Vm {
             }
         }
         self.frames.push(CallFrame {
-            function: closure.function,
+            module: function.module,
+            function: function.function,
             instruction_pointer: 0,
             stack_base: self.stack.len(),
             locals,
@@ -654,6 +685,62 @@ impl Vm {
             iterators: Vec::new(),
         });
         Ok(None)
+    }
+
+    fn builtin_exists(&self, arguments: &[Value]) -> RuntimeResult<Value> {
+        let [Value::String(expression)] = arguments else {
+            return Err(RuntimeError::coded(
+                "E730",
+                RuntimeErrorKind::TypeError,
+                "exists() requires one String argument",
+            ));
+        };
+        let expression = expression.as_ref();
+        let exists = if let Some(function) = expression.strip_prefix('*') {
+            self.builtins.contains(function)
+                || matches!(
+                    self.globals.get(&format!(":{function}")),
+                    Some(Value::Closure(_) | Value::Builtin(_) | Value::HostFunction(_))
+                )
+                || matches!(
+                    self.globals.get(&format!("g:{function}")),
+                    Some(Value::Closure(_) | Value::HostFunction(_))
+                )
+        } else if let Some(environment) = expression.strip_prefix('$') {
+            std::env::var_os(environment).is_some()
+        } else if let Some(name) = expression.strip_prefix("s:") {
+            let source = self
+                .frames
+                .last()
+                .map_or(self.module.source, |frame| frame.module.source);
+            self.globals.contains_key(&format!("s{}:{name}", source.0))
+        } else if expression.starts_with('&')
+            || expression.starts_with(':')
+            || expression.starts_with('+')
+        {
+            false
+        } else {
+            let runtime_name = if expression.contains(':') {
+                expression.to_owned()
+            } else {
+                format!(":{expression}")
+            };
+            self.globals.contains_key(&runtime_name)
+        };
+        Ok(Value::Integer(i64::from(exists)))
+    }
+
+    fn namespace_dictionary(&self, prefix: &str) -> Value {
+        let values = self
+            .globals
+            .iter()
+            .filter_map(|(name, value)| {
+                name.strip_prefix(prefix)
+                    .filter(|key| !key.is_empty())
+                    .map(|key| (key.to_owned(), value.clone()))
+            })
+            .collect::<BTreeMap<_, _>>();
+        Value::Dictionary(values)
     }
 
     fn unary(&self, operator: UnaryOperator, value: Value) -> RuntimeResult<Value> {
@@ -761,19 +848,22 @@ impl Vm {
         }
     }
     fn jump(&mut self, target: u32) -> RuntimeResult<()> {
-        let code_len = self
-            .prototype(self.frames.last().expect("frame").function)?
-            .code
-            .len();
+        let frame = self.frames.last().expect("frame");
+        let code_len = self.prototype(&frame.module, frame.function)?.code.len();
         if target as usize > code_len {
             return Err(self.error(RuntimeErrorKind::Internal, "jump target is out of bounds"));
         }
         self.frames.last_mut().expect("frame").instruction_pointer = target;
         Ok(())
     }
-    fn constant_value(&self, function: FunctionId, id: ConstantId) -> RuntimeResult<Value> {
+    fn constant_value(
+        &self,
+        module: &Arc<BytecodeModule>,
+        function: FunctionId,
+        id: ConstantId,
+    ) -> RuntimeResult<Value> {
         match self
-            .prototype(function)?
+            .prototype(module, function)?
             .constants
             .get(id.0 as usize)
             .ok_or_else(|| {
@@ -789,7 +879,10 @@ impl Vm {
             Constant::String(value) => Ok(Value::String(Arc::from(value.as_str()))),
             Constant::Blob(value) => Ok(Value::Blob(Arc::from(value.as_slice()))),
             Constant::Function(function) => Ok(Value::Closure(Arc::new(Closure {
-                function: *function,
+                function: FunctionRef {
+                    module: module.clone(),
+                    function: *function,
+                },
                 captures: Vec::new(),
             }))),
             Constant::Command(_) => Err(self.error(
@@ -800,23 +893,41 @@ impl Vm {
     }
     fn constant_command(
         &self,
+        module: &BytecodeModule,
         function: FunctionId,
         id: ConstantId,
     ) -> RuntimeResult<crate::ast::ExCommand> {
-        match self.prototype(function)?.constants.get(id.0 as usize) {
+        match self
+            .prototype(module, function)?
+            .constants
+            .get(id.0 as usize)
+        {
             Some(Constant::Command(command)) => Ok((**command).clone()),
             _ => Err(self.error(RuntimeErrorKind::Internal, "constant is not a command")),
         }
     }
 
-    fn constant_string(&self, function: FunctionId, id: ConstantId) -> RuntimeResult<String> {
-        match self.prototype(function)?.constants.get(id.0 as usize) {
+    fn constant_string(
+        &self,
+        module: &BytecodeModule,
+        function: FunctionId,
+        id: ConstantId,
+    ) -> RuntimeResult<String> {
+        match self
+            .prototype(module, function)?
+            .constants
+            .get(id.0 as usize)
+        {
             Some(Constant::String(value)) => Ok(value.clone()),
             _ => Err(self.error(RuntimeErrorKind::Internal, "constant is not a string")),
         }
     }
-    fn prototype(&self, function: FunctionId) -> RuntimeResult<&FunctionPrototype> {
-        self.module.function(function).ok_or_else(|| {
+    fn prototype<'a>(
+        &self,
+        module: &'a BytecodeModule,
+        function: FunctionId,
+    ) -> RuntimeResult<&'a FunctionPrototype> {
+        module.function(function).ok_or_else(|| {
             self.error(
                 RuntimeErrorKind::Internal,
                 format!("function {} is missing", function.0),
@@ -857,7 +968,7 @@ impl Vm {
     }
     fn current_span(&self) -> Option<Span> {
         let frame = self.frames.last()?;
-        let prototype = self.module.function(frame.function)?;
+        let prototype = frame.module.function(frame.function)?;
         let ip = frame.instruction_pointer.saturating_sub(1);
         prototype
             .spans
@@ -871,7 +982,7 @@ impl Vm {
             .iter()
             .rev()
             .map(|frame| {
-                let prototype = self.module.function(frame.function);
+                let prototype = frame.module.function(frame.function);
                 StackTraceEntry {
                     function: prototype.and_then(|value| value.name.clone()),
                     span: prototype.and_then(|value| {

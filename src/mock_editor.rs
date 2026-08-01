@@ -21,6 +21,18 @@ impl MockBuffer {
     }
 }
 
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct HighlightStyle {
+    pub attributes: HashMap<String, String>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct HighlightRegistry {
+    pub groups: HashMap<String, HighlightStyle>,
+    pub links: HashMap<String, String>,
+    pub clear_count: usize,
+}
+
 #[derive(Clone, Debug)]
 pub struct MockEditorState {
     pub buffers: HashMap<u64, MockBuffer>,
@@ -30,6 +42,8 @@ pub struct MockEditorState {
     pub messages: Vec<String>,
     pub command_log: Vec<CommandRequest>,
     pub write_count: usize,
+    pub highlights: HighlightRegistry,
+    pub syntax_reset_count: usize,
 }
 
 impl Default for MockEditorState {
@@ -43,6 +57,8 @@ impl Default for MockEditorState {
             messages: Vec::new(),
             command_log: Vec::new(),
             write_count: 0,
+            highlights: HighlightRegistry::default(),
+            syntax_reset_count: 0,
         }
     }
 }
@@ -144,6 +160,14 @@ impl Host for MockEditor {
                 }
                 "set" | "se" => {
                     apply_set(&mut state.options, &request.command.arguments)?;
+                    Ok(Value::Null)
+                }
+                "highlight" | "hi" => {
+                    apply_highlight(&mut state.highlights, &request.command.arguments)?;
+                    Ok(Value::Null)
+                }
+                "syntax" | "syn" if request.command.arguments.trim() == "reset" => {
+                    state.syntax_reset_count += 1;
                     Ok(Value::Null)
                 }
                 name => Err(RuntimeError::coded(
@@ -254,6 +278,54 @@ fn apply_set(options: &mut HashMap<String, Value>, arguments: &str) -> RuntimeRe
             options.insert(option.to_string(), Value::Bool(true));
         }
     }
+    Ok(())
+}
+
+fn apply_highlight(registry: &mut HighlightRegistry, arguments: &str) -> RuntimeResult<()> {
+    let mut parts = arguments.split_whitespace().peekable();
+    let Some(first) = parts.next() else {
+        return Ok(());
+    };
+    if first.eq_ignore_ascii_case("clear") {
+        registry.clear_count += 1;
+        if let Some(group) = parts.next() {
+            registry.groups.remove(group);
+            registry.links.remove(group);
+        } else {
+            registry.groups.clear();
+            registry.links.clear();
+        }
+        return Ok(());
+    }
+    let first = if first.eq_ignore_ascii_case("default") || first.eq_ignore_ascii_case("def") {
+        parts
+            .next()
+            .ok_or_else(|| invalid_argument("highlight default requires a group or link"))?
+    } else {
+        first
+    };
+    if first.eq_ignore_ascii_case("link") {
+        let from = parts
+            .next()
+            .ok_or_else(|| invalid_argument("highlight link requires a source group"))?;
+        let to = parts
+            .next()
+            .ok_or_else(|| invalid_argument("highlight link requires a target group"))?;
+        registry.links.insert(from.to_owned(), to.to_owned());
+        return Ok(());
+    }
+    let style = registry.groups.entry(first.to_owned()).or_default();
+    for attribute in parts {
+        let Some((name, value)) = attribute.split_once('=') else {
+            return Err(invalid_argument(format!(
+                "invalid highlight attribute: {attribute}"
+            )));
+        };
+        style
+            .attributes
+            .insert(name.to_ascii_lowercase(), value.to_owned());
+    }
+    registry.links.remove(first);
     Ok(())
 }
 

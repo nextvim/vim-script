@@ -20,6 +20,7 @@ const COMPATIBILITY_FIXTURES: &[(&str, &str)] = &[
     ("control_flow.vim", "[26, 3]"),
     ("trycatch.vim", "11"),
     ("builtins.vim", "[4, 2, 5, '2,3,4,5', 'VIM']"),
+    ("exists.vim", "[1, 0, 1, 1, 1, 7]"),
 ];
 
 fn fixture(name: &str) -> PathBuf {
@@ -35,7 +36,7 @@ fn compile_vm(source: &str) -> Vm {
         "lexer diagnostics: {:?}",
         lexed.diagnostics
     );
-    let parsed = Parser::new(&lexed.tokens).parse();
+    let parsed = Parser::new_with_source(&lexed.tokens, source).parse();
     assert!(
         parsed.diagnostics.is_empty(),
         "parser diagnostics: {:?}",

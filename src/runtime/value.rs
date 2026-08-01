@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use crate::bytecode::BytecodeModule;
 use crate::resolver::FunctionId;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -13,8 +14,20 @@ pub struct OperationId(pub u64);
 pub struct HostObjectId(pub u64);
 
 #[derive(Clone, Debug)]
-pub struct Closure {
+pub struct FunctionRef {
+    pub module: Arc<BytecodeModule>,
     pub function: FunctionId,
+}
+
+impl PartialEq for FunctionRef {
+    fn eq(&self, other: &Self) -> bool {
+        self.function == other.function && Arc::ptr_eq(&self.module, &other.module)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct Closure {
+    pub function: FunctionRef,
     pub captures: Vec<Value>,
 }
 

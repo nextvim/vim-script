@@ -1,4 +1,5 @@
 use crate::ast::*;
+use crate::ex_parser::ExLineParser;
 use crate::lexer::{Keyword, Operator, Token, TokenKind};
 use crate::source::{Diagnostic, SourceId, Span};
 
@@ -11,6 +12,7 @@ pub struct Parser<'a> {
     pub diagnostics: Vec<Diagnostic>,
     pub loop_depth: usize,
     pub function_depth: usize,
+    source: Option<&'a str>,
     next_node_id: u32,
 }
 
@@ -37,8 +39,15 @@ impl<'a> Parser<'a> {
             diagnostics: Vec::new(),
             loop_depth: 0,
             function_depth: 0,
+            source: None,
             next_node_id: 0,
         }
+    }
+
+    pub fn new_with_source(tokens: &'a [Token], source: &'a str) -> Self {
+        let mut parser = Self::new(tokens);
+        parser.source = Some(source);
+        parser
     }
 
     pub fn parse(mut self) -> ParseOutput {
@@ -156,6 +165,11 @@ impl<'a> Parser<'a> {
             }
             TokenKind::Colon => {
                 self.advance();
+                StmtKind::ExCommand(self.ex_command()?)
+            }
+            TokenKind::Identifier(_)
+                if self.source.is_some() && self.looks_like_source_ex_command() =>
+            {
                 StmtKind::ExCommand(self.ex_command()?)
             }
             TokenKind::Identifier(_) if self.looks_like_ex_command() => {
@@ -721,6 +735,35 @@ impl<'a> Parser<'a> {
     }
 
     fn ex_command(&mut self) -> ParseResult<ExCommand> {
+        if let Some(source) = self.source {
+            let offset = self.current().span.start as usize;
+            let line_start = source[..offset].rfind('\n').map_or(0, |index| index + 1);
+            let line_end = source[offset..]
+                .find(['\r', '\n'])
+                .map_or(source.len(), |index| offset + index);
+            let parsed = match ExLineParser::new(
+                self.current().span.source,
+                &source[line_start..line_end],
+                line_start,
+            )
+            .parse()
+            {
+                Ok(parsed) => parsed,
+                Err(diagnostic) => {
+                    self.diagnostics.push(*diagnostic);
+                    return Err(());
+                }
+            };
+            let stop = parsed.next_command.map_or(line_end, |span| {
+                source[line_start..span.start as usize]
+                    .rfind('|')
+                    .map_or(span.start as usize, |index| line_start + index)
+            });
+            while !self.at_end() && self.current().span.start < stop as u32 {
+                self.advance();
+            }
+            return Ok(parsed.command);
+        }
         let name = self.expect_identifier("expected Ex command name")?;
         let bang = self.consume_operator(Operator::Not);
         let mut parts = Vec::new();
@@ -737,6 +780,40 @@ impl<'a> Parser<'a> {
             register: None,
             arguments: parts.join(" "),
         })
+    }
+
+    fn looks_like_source_ex_command(&self) -> bool {
+        let Some(next) = self.tokens.get(self.cursor + 1) else {
+            return true;
+        };
+        !matches!(
+            next.kind,
+            TokenKind::LeftParen
+                | TokenKind::LeftBracket
+                | TokenKind::Dot
+                | TokenKind::Operator(
+                    Operator::Assign
+                        | Operator::AddAssign
+                        | Operator::SubtractAssign
+                        | Operator::MultiplyAssign
+                        | Operator::DivideAssign
+                        | Operator::RemainderAssign
+                        | Operator::ConcatenateAssign
+                        | Operator::Add
+                        | Operator::Subtract
+                        | Operator::Multiply
+                        | Operator::Divide
+                        | Operator::Remainder
+                        | Operator::Concatenate
+                        | Operator::Equal
+                        | Operator::NotEqual
+                        | Operator::Match
+                        | Operator::NoMatch
+                        | Operator::LogicalAnd
+                        | Operator::LogicalOr
+                        | Operator::Coalesce
+                )
+        )
     }
 
     fn looks_like_ex_command(&self) -> bool {
@@ -1050,6 +1127,28 @@ mod tests {
             output.program.unwrap().statements[0].kind,
             StmtKind::Function(_)
         ));
+    }
+
+    #[test]
+    fn source_aware_ex_commands_preserve_raw_syntax_and_bars() {
+        let source = ":silent! 1,2write! file name.txt | echo \"done\"\nnnoremap <silent> <leader>w :write<CR>\n";
+        let lexed = Lexer::new(SourceId(0), source).lex();
+        assert!(lexed.diagnostics.is_empty(), "{:?}", lexed.diagnostics);
+        let output = Parser::new_with_source(&lexed.tokens, source).parse();
+        assert!(output.diagnostics.is_empty(), "{:?}", output.diagnostics);
+        let program = output.program.unwrap();
+        let StmtKind::ExCommand(write) = &program.statements[0].kind else {
+            panic!("expected write command")
+        };
+        assert_eq!(write.name, "write");
+        assert!(write.bang);
+        assert_eq!(write.arguments, "file name.txt");
+        assert!(matches!(program.statements[1].kind, StmtKind::Echo(_)));
+        let StmtKind::ExCommand(mapping) = &program.statements[2].kind else {
+            panic!("expected mapping command")
+        };
+        assert_eq!(mapping.name, "nnoremap");
+        assert_eq!(mapping.arguments, "<silent> <leader>w :write<CR>");
     }
 
     #[test]

@@ -80,6 +80,8 @@ pub struct ResolvedProgram {
 #[derive(Clone, Debug)]
 pub struct ResolverConfig {
     pub builtins: HashSet<String>,
+    /// Treat unresolved `name#part#function` references as lazy autoload functions.
+    pub allow_autoload: bool,
     /// Hosts often supply globals dynamically. When enabled, an unresolved explicit
     /// global is materialized instead of diagnosed.
     pub allow_dynamic_globals: bool,
@@ -96,6 +98,7 @@ impl Default for ResolverConfig {
             .into_iter()
             .map(str::to_owned)
             .collect(),
+            allow_autoload: true,
             allow_dynamic_globals: true,
         }
     }
@@ -597,6 +600,26 @@ impl Resolver {
                 return Some(*symbol);
             }
             scope = lexical_scope.parent;
+        }
+        if name.name == "version" {
+            return Some(self.define_in(
+                ScopeId(0),
+                "version".into(),
+                Scope::Vim,
+                SymbolKind::Variable,
+                Span::default(),
+                false,
+            ));
+        }
+        if self.config.allow_autoload && name.name.contains('#') {
+            return Some(self.define_in(
+                ScopeId(0),
+                name.name.clone(),
+                Scope::Unqualified,
+                SymbolKind::Function,
+                Span::default(),
+                false,
+            ));
         }
         None
     }
