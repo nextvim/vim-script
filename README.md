@@ -2,6 +2,63 @@
 
 A host-agnostic, embeddable Vim script interpreter and asynchronous VM runtime written in Rust.
 
+## Try it
+
+Run the end-to-end showcase:
+
+```sh
+cargo run
+```
+
+Start the persistent interactive interpreter:
+
+```sh
+cargo run --example interpreter
+```
+
+The REPL supports multiline functions and control-flow blocks. Use `.eval EXPR` to print an expression, `.globals` to inspect persistent runtime state, `.editor` to inspect the mock editor, and `.help` for all commands.
+
+## Library usage
+
+Compile and execute Vimscript, then inspect values left in the VM's global scope:
+
+```rust
+use vim_script::compiler::Compiler;
+use vim_script::lexer::Lexer;
+use vim_script::parser::Parser;
+use vim_script::resolver::{Resolver, ResolverConfig};
+use vim_script::runtime::{Scheduler, Value, Vm};
+use vim_script::SourceId;
+
+let source = r#"
+    let g:numbers = range(1, 5)
+    let g:answer = len(g:numbers) * 2
+"#;
+
+let lexed = Lexer::new(SourceId(0), source).lex();
+assert!(lexed.diagnostics.is_empty());
+
+let parsed = Parser::new_with_source(&lexed.tokens, source).parse();
+assert!(parsed.diagnostics.is_empty());
+
+let resolved = Resolver::new(ResolverConfig::default())
+    .resolve(parsed.program.expect("parsed program"));
+assert!(resolved.diagnostics.is_empty());
+
+let compiled = Compiler::new(&resolved.program.expect("resolved program")).compile();
+assert!(compiled.diagnostics.is_empty());
+
+let vm = Vm::new(compiled.module.expect("bytecode module")).expect("valid VM");
+let mut scheduler = Scheduler::new(1_000);
+let task = scheduler.spawn(vm).expect("spawn VM");
+scheduler.run_until_complete(task).expect("execute Vimscript");
+
+let globals = &scheduler.task(task).expect("completed task").vm.globals;
+assert_eq!(globals.get("g:answer"), Some(&Value::Integer(10)));
+```
+
+Host functions and editor commands can be exposed with `HostRuntime`; see `src/main.rs` for an end-to-end embedding example with capabilities and asynchronous host calls.
+
 ## Authoritative references
 
 Vim's help files are the practical language specification. The most important references are:
