@@ -498,6 +498,7 @@ impl Resolver {
         output: &mut Vec<SymbolId>,
     ) {
         match target {
+            AssignmentTarget::Option(_) => {}
             AssignmentTarget::Name(name) => {
                 let symbol = self.declare_name(name, is_const, span);
                 output.push(symbol);

@@ -3,6 +3,7 @@ use std::collections::HashSet;
 use crate::ast::*;
 use crate::bytecode::{
     BytecodeModule, Constant, ConstantId, ExceptionHandler, FunctionPrototype, Instruction,
+    OptionScopeOperand,
 };
 use crate::resolver::{FunctionId, ResolvedFunction, ResolvedProgram, ScopeId, Symbol, SymbolId};
 use crate::source::{Diagnostic, Span};
@@ -114,8 +115,12 @@ impl<'a> Compiler<'a> {
     fn compile_stmt(&mut self, stmt: &Stmt) {
         match &stmt.kind {
             StmtKind::Assignment(assignment) => {
-                self.compile_expr(&assignment.value);
-                self.store_target(&assignment.target, stmt.span, Some(stmt.id));
+                if let AssignmentTarget::Option(option) = &assignment.target {
+                    self.compile_option_assignment(option, assignment, stmt.span);
+                } else {
+                    self.compile_expr(&assignment.value);
+                    self.store_target(&assignment.target, stmt.span, Some(stmt.id));
+                }
             }
             StmtKind::Unlet(_) => {}
             StmtKind::Expression(expr) => {
@@ -514,7 +519,18 @@ impl<'a> Compiler<'a> {
                 let constant = self.constant(Constant::String(text));
                 self.emit(Instruction::LoadConstant(constant), expr.span);
             }
-            ExprKind::Register(_) | ExprKind::Option(_) | ExprKind::Environment(_) => {
+            ExprKind::Option(option) => {
+                let name = self.constant(Constant::String(option.name.clone()));
+                self.emit(
+                    Instruction::LoadOption {
+                        scope: option_scope(option.scope),
+                        name,
+                    },
+                    expr.span,
+                );
+                self.emit(Instruction::Await, expr.span);
+            }
+            ExprKind::Register(_) | ExprKind::Environment(_) => {
                 self.error(
                     "C005",
                     "host-backed value is unavailable in the synchronous core",
@@ -532,6 +548,10 @@ impl<'a> Compiler<'a> {
         declaration_node: Option<NodeId>,
     ) {
         match target {
+            AssignmentTarget::Option(_) => {
+                self.error("C009", "option assignment was not lowered", span);
+                self.emit(Instruction::Pop, span);
+            }
             AssignmentTarget::Name(_) => {
                 let statement = declaration_node
                     .and_then(|node| self.program.declarations.get(&node))
@@ -565,6 +585,48 @@ impl<'a> Compiler<'a> {
                 self.emit(Instruction::Pop, span);
             }
         }
+    }
+
+    fn compile_option_assignment(
+        &mut self,
+        option: &OptionName,
+        assignment: &Assignment,
+        span: Span,
+    ) {
+        if assignment.operator != AssignmentOperator::Assign {
+            let name = self.constant(Constant::String(option.name.clone()));
+            self.emit(
+                Instruction::LoadOption {
+                    scope: option_scope(option.scope),
+                    name,
+                },
+                span,
+            );
+            self.emit(Instruction::Await, span);
+        }
+        self.compile_expr(&assignment.value);
+        let binary = match assignment.operator {
+            AssignmentOperator::Assign => None,
+            AssignmentOperator::Add => Some(BinaryOperator::Add),
+            AssignmentOperator::Subtract => Some(BinaryOperator::Subtract),
+            AssignmentOperator::Multiply => Some(BinaryOperator::Multiply),
+            AssignmentOperator::Divide => Some(BinaryOperator::Divide),
+            AssignmentOperator::Remainder => Some(BinaryOperator::Remainder),
+            AssignmentOperator::Concatenate => Some(BinaryOperator::Concatenate),
+        };
+        if let Some(binary) = binary {
+            self.emit(Instruction::Binary(binary), span);
+        }
+        let name = self.constant(Constant::String(option.name.clone()));
+        self.emit(
+            Instruction::StoreOption {
+                scope: option_scope(option.scope),
+                name,
+            },
+            span,
+        );
+        self.emit(Instruction::Await, span);
+        self.emit(Instruction::Pop, span);
     }
 
     fn symbol_matches_target(&self, symbol: SymbolId, target: &AssignmentTarget) -> bool {
@@ -722,6 +784,14 @@ impl FunctionBuilder {
             spans: self.spans,
             handlers: self.handlers,
         }
+    }
+}
+
+fn option_scope(scope: OptionScope) -> OptionScopeOperand {
+    match scope {
+        OptionScope::Unqualified | OptionScope::GlobalLocal => OptionScopeOperand::Unqualified,
+        OptionScope::Local => OptionScopeOperand::Local,
+        OptionScope::Global => OptionScopeOperand::Global,
     }
 }
 

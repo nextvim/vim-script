@@ -52,6 +52,7 @@ pub struct Assignment {
 #[derive(Clone, Debug)]
 pub enum AssignmentTarget {
     Name(ScopedName),
+    Option(OptionName),
     Index {
         target: Box<Expr>,
         index: Box<Expr>,

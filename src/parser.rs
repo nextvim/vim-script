@@ -211,6 +211,7 @@ impl<'a> Parser<'a> {
     fn assignment_target(&mut self, expr: Expr) -> ParseResult<AssignmentTarget> {
         match expr.kind {
             ExprKind::Variable(name) => Ok(AssignmentTarget::Name(name)),
+            ExprKind::Option(name) => Ok(AssignmentTarget::Option(name)),
             ExprKind::Index { target, index } => Ok(AssignmentTarget::Index { target, index }),
             ExprKind::Slice { target, start, end } => {
                 Ok(AssignmentTarget::Slice { target, start, end })
@@ -557,6 +558,32 @@ impl<'a> Parser<'a> {
             }
             TokenKind::Identifier(name) => {
                 self.expr(token.span, ExprKind::Variable(scoped_name(&name)))
+            }
+            TokenKind::Ampersand => {
+                let option = self.current().clone();
+                let TokenKind::Identifier(raw) = option.kind else {
+                    self.error_here("P041", "expected an option name after '&'");
+                    return Err(());
+                };
+                self.advance();
+                let (scope, name) = if let Some(name) = raw.strip_prefix("l:") {
+                    (OptionScope::Local, name)
+                } else if let Some(name) = raw.strip_prefix("g:") {
+                    (OptionScope::Global, name)
+                } else {
+                    (OptionScope::Unqualified, raw.as_str())
+                };
+                if name.is_empty() || name.contains(':') {
+                    self.error_here("P041", "invalid option scope or name");
+                    return Err(());
+                }
+                self.expr(
+                    token.span.merge(option.span),
+                    ExprKind::Option(OptionName {
+                        scope,
+                        name: name.to_owned(),
+                    }),
+                )
             }
             TokenKind::Operator(Operator::Subtract) => {
                 let operand = self.expression(80)?;
@@ -1009,6 +1036,7 @@ fn token_text(kind: &TokenKind) -> String {
         TokenKind::Comma => ",".into(),
         TokenKind::Colon => ":".into(),
         TokenKind::Question => "?".into(),
+        TokenKind::Ampersand => "&".into(),
         TokenKind::Dot => ".".into(),
         TokenKind::Heredoc { content, .. } => content.clone(),
         TokenKind::Semicolon

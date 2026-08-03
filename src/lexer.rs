@@ -23,6 +23,7 @@ pub enum TokenKind {
     Comma,
     Colon,
     Question,
+    Ampersand,
     Semicolon,
     Dot,
     Newline,
@@ -240,6 +241,11 @@ impl<'a> Lexer<'a> {
                 '%' => self.simple_or_assign(Operator::Remainder, Operator::RemainderAssign),
                 '&' if self.peek_next() == Some('&') => {
                     self.operator("&&", Operator::LogicalAnd, true)
+                }
+                '&' => {
+                    self.bump();
+                    self.expects_operand = true;
+                    TokenKind::Ampersand
                 }
                 '?' if self.peek_next() == Some('?') => {
                     self.operator("??", Operator::Coalesce, true)

@@ -5,6 +5,13 @@ use crate::source::{SourceId, Span};
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct ConstantId(pub u32);
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OptionScopeOperand {
+    Unqualified,
+    Local,
+    Global,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum Constant {
     Null,
@@ -28,8 +35,22 @@ pub enum Instruction {
     StoreCapture(u32),
     LoadGlobal(ConstantId),
     StoreGlobal(ConstantId),
-    LoadScoped { scope: u8, name: ConstantId },
-    StoreScoped { scope: u8, name: ConstantId },
+    LoadScoped {
+        scope: u8,
+        name: ConstantId,
+    },
+    StoreScoped {
+        scope: u8,
+        name: ConstantId,
+    },
+    LoadOption {
+        scope: OptionScopeOperand,
+        name: ConstantId,
+    },
+    StoreOption {
+        scope: OptionScopeOperand,
+        name: ConstantId,
+    },
     Pop,
     Duplicate,
     Unary(UnaryOperator),
@@ -40,17 +61,28 @@ pub enum Instruction {
     SetIndex,
     GetMember(ConstantId),
     Call(u16),
-    CallNamed { name: ConstantId, argc: u16 },
+    CallNamed {
+        name: ConstantId,
+        argc: u16,
+    },
     Return,
-    MakeClosure { function: FunctionId, captures: u16 },
+    MakeClosure {
+        function: FunctionId,
+        captures: u16,
+    },
     Jump(u32),
     JumpIfFalse(u32),
     JumpIfTrue(u32),
     Loop(u32),
     IterStart,
-    IterNext { end: u32 },
+    IterNext {
+        end: u32,
+    },
     IterEnd,
-    TryBegin { handler: u32, stack_depth: u32 },
+    TryBegin {
+        handler: u32,
+        stack_depth: u32,
+    },
     TryEnd,
     Throw,
     Await,

@@ -296,6 +296,21 @@ impl Scheduler {
                 let result = dispatched.map(|future| self.register_boxed(future));
                 self.resume_host_call(id, result)?;
             }
+            Ok(VmRunOutcome::OptionCall(request)) => {
+                let dispatched = self
+                    .host
+                    .as_ref()
+                    .ok_or_else(|| {
+                        RuntimeError::coded(
+                            "E_HOST",
+                            RuntimeErrorKind::HostError,
+                            "no host runtime is configured",
+                        )
+                    })
+                    .and_then(|host| host.dispatch_option(request));
+                let result = dispatched.map(|future| self.register_boxed(future));
+                self.resume_host_call(id, result)?;
+            }
             Ok(VmRunOutcome::CommandCall(request)) => {
                 if request.command.name == "command" {
                     let result = self
@@ -309,6 +324,20 @@ impl Scheduler {
                             )
                         })
                         .and_then(|host| host.define_user_command(&request.command))
+                        .map(|()| Value::Null);
+                    self.complete_command(id, result)?;
+                } else if request.command.name == "delcommand" {
+                    let result = self
+                        .host
+                        .as_mut()
+                        .ok_or_else(|| {
+                            RuntimeError::coded(
+                                "E_HOST",
+                                RuntimeErrorKind::HostError,
+                                "no host runtime is configured",
+                            )
+                        })
+                        .and_then(|host| host.delete_user_command(&request.command))
                         .map(|()| Value::Null);
                     self.complete_command(id, result)?;
                 } else {
@@ -490,7 +519,7 @@ mod tests {
     use crate::compiler::Compiler;
     use crate::host::{
         Arity, Capability, CommandDefinition, CommandRequest, Host, HostContext, HostRequest,
-        HostRuntime,
+        HostRuntime, OptionRequest, OptionRequestOperation,
     };
     use crate::lexer::Lexer;
     use crate::parser::Parser;
@@ -546,6 +575,29 @@ mod tests {
         fn execute_command(&self, request: CommandRequest) -> crate::host::HostFuture {
             self.commands.lock().unwrap().push(request);
             Box::pin(async { Ok(Value::Null) })
+        }
+    }
+
+    struct OptionHost {
+        value: Arc<Mutex<Value>>,
+    }
+
+    impl Host for OptionHost {
+        fn call(&self, _request: HostRequest) -> crate::host::HostFuture {
+            Box::pin(async { Ok(Value::Null) })
+        }
+
+        fn option(&self, request: OptionRequest) -> crate::host::HostFuture {
+            let value = self.value.clone();
+            Box::pin(async move {
+                match request.operation {
+                    OptionRequestOperation::Get => Ok(value.lock().unwrap().clone()),
+                    OptionRequestOperation::Set(new_value) => {
+                        *value.lock().unwrap() = new_value;
+                        Ok(Value::Null)
+                    }
+                }
+            })
         }
     }
 
@@ -642,6 +694,29 @@ mod tests {
         let commands = commands.lock().unwrap();
         assert_eq!(commands.len(), 1);
         assert_eq!(commands[0].command.name, "write");
+    }
+
+    #[test]
+    fn option_reads_writes_and_compound_assignments_are_implicitly_awaited() {
+        let value = Arc::new(Mutex::new(Value::Integer(40)));
+        let mut runtime = HostRuntime::new(Arc::new(OptionHost {
+            value: value.clone(),
+        }));
+        runtime.capabilities.grant(Capability::Settings);
+        let mut scheduler = Scheduler::new(10);
+        scheduler.set_host(runtime);
+        let task = scheduler
+            .spawn(vm(
+                "let g:before = &number\nlet &number += 2\nlet g:after = &number\n",
+                HashMap::new(),
+            ))
+            .unwrap();
+
+        scheduler.run_until_complete(task).unwrap();
+        let globals = &scheduler.task(task).unwrap().vm.globals;
+        assert_eq!(globals.get("g:before"), Some(&Value::Integer(40)));
+        assert_eq!(globals.get("g:after"), Some(&Value::Integer(42)));
+        assert_eq!(*value.lock().unwrap(), Value::Integer(42));
     }
 
     #[test]

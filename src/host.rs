@@ -19,6 +19,16 @@ pub type HostFuture = Pin<Box<dyn Future<Output = RuntimeResult<Value>> + Send +
 pub trait Host: Send + Sync + 'static {
     fn call(&self, request: HostRequest) -> HostFuture;
 
+    fn option(&self, request: OptionRequest) -> HostFuture {
+        Box::pin(async move {
+            Err(RuntimeError::coded(
+                "E_HOST",
+                RuntimeErrorKind::HostError,
+                format!("host does not implement option access for {}", request.name),
+            ))
+        })
+    }
+
     fn execute_command(&self, request: CommandRequest) -> HostFuture {
         Box::pin(async move {
             Err(RuntimeError::coded(
@@ -36,6 +46,27 @@ pub struct HostRequest {
     pub function: String,
     pub arguments: Vec<Value>,
     pub context: HostContext,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct OptionRequest {
+    pub operation: OptionRequestOperation,
+    pub name: String,
+    pub scope: OptionRequestScope,
+    pub context: HostContext,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum OptionRequestOperation {
+    Get,
+    Set(Value),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OptionRequestScope {
+    Unqualified,
+    Local,
+    Global,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -224,6 +255,44 @@ impl HostRuntime {
 
     pub fn remove_user_command(&mut self, name: &str) -> bool {
         self.user_commands.remove(name).is_some()
+    }
+
+    pub fn delete_user_command(&mut self, command: &ExCommand) -> RuntimeResult<()> {
+        let mut arguments = command.arguments.split_whitespace();
+        let name = arguments.next().ok_or_else(|| {
+            RuntimeError::coded(
+                "E184",
+                RuntimeErrorKind::InvalidCommand,
+                "user command name is required",
+            )
+        })?;
+        if command.bang || command.range.is_some() || arguments.next().is_some() {
+            return Err(RuntimeError::coded(
+                "E488",
+                RuntimeErrorKind::InvalidCommand,
+                "invalid :delcommand arguments",
+            ));
+        }
+        if self.remove_user_command(name) {
+            Ok(())
+        } else {
+            Err(RuntimeError::coded(
+                "E184",
+                RuntimeErrorKind::InvalidCommand,
+                format!("no such user-defined command: {name}"),
+            ))
+        }
+    }
+
+    pub fn list_user_commands(&self, prefix: Option<&str>) -> Vec<UserCommand> {
+        let mut commands = self
+            .user_commands
+            .values()
+            .filter(|command| prefix.is_none_or(|prefix| command.name.starts_with(prefix)))
+            .cloned()
+            .collect::<Vec<_>>();
+        commands.sort_by(|left, right| left.name.cmp(&right.name));
+        commands
     }
 
     /// Handles mapping and autocommand registration commands internally.
@@ -475,6 +544,17 @@ impl HostRuntime {
         }
         request.target = registration.target.clone();
         Ok(self.host.call(request))
+    }
+
+    pub fn dispatch_option(&self, request: OptionRequest) -> RuntimeResult<HostFuture> {
+        if !self.capabilities.allows(&Capability::Settings) {
+            return Err(RuntimeError::coded(
+                "E_PERM",
+                RuntimeErrorKind::PermissionDenied,
+                format!("option {} requires capability Settings", request.name),
+            ));
+        }
+        Ok(self.host.option(request))
     }
 
     pub fn dispatch_command(&self, mut request: CommandRequest) -> RuntimeResult<HostFuture> {

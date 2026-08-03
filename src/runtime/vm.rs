@@ -2,8 +2,13 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use crate::ast::{BinaryOperator, UnaryOperator};
-use crate::bytecode::{BytecodeModule, Constant, ConstantId, FunctionPrototype, Instruction};
-use crate::host::{CommandRequest, HostContext, HostRequest, HostTarget};
+use crate::bytecode::{
+    BytecodeModule, Constant, ConstantId, FunctionPrototype, Instruction, OptionScopeOperand,
+};
+use crate::host::{
+    CommandRequest, HostContext, HostRequest, HostTarget, OptionRequest, OptionRequestOperation,
+    OptionRequestScope,
+};
 use crate::resolver::FunctionId;
 use crate::runtime::{BuiltinRegistry, Closure, FunctionRef, OperationId, Value};
 use crate::source::Span;
@@ -45,6 +50,7 @@ pub enum VmStatus {
 pub enum StepOutcome {
     Continue,
     HostCall(HostRequest),
+    OptionCall(OptionRequest),
     CommandCall(CommandRequest),
     Waiting(OperationId),
     Completed(Value),
@@ -54,6 +60,7 @@ pub enum StepOutcome {
 pub enum VmRunOutcome {
     Yielded,
     HostCall(HostRequest),
+    OptionCall(OptionRequest),
     CommandCall(CommandRequest),
     Waiting(OperationId),
     Completed(Value),
@@ -177,6 +184,15 @@ impl Vm {
                         ),
                     ));
                 }
+                VmRunOutcome::OptionCall(request) => {
+                    return Err(self.error(
+                        RuntimeErrorKind::HostError,
+                        format!(
+                            "option access {} requires a scheduler and host runtime",
+                            request.name
+                        ),
+                    ));
+                }
                 VmRunOutcome::CommandCall(request) => {
                     return Err(self.error(
                         RuntimeErrorKind::HostError,
@@ -210,6 +226,10 @@ impl Vm {
                 Ok(StepOutcome::HostCall(request)) => {
                     self.status = VmStatus::Ready;
                     return Ok(VmRunOutcome::HostCall(request));
+                }
+                Ok(StepOutcome::OptionCall(request)) => {
+                    self.status = VmStatus::Ready;
+                    return Ok(VmRunOutcome::OptionCall(request));
                 }
                 Ok(StepOutcome::CommandCall(request)) => {
                     self.status = VmStatus::Ready;
@@ -392,6 +412,25 @@ impl Vm {
                 let name = self.constant_string(&module, function_id, id)?;
                 let value = self.pop()?;
                 self.globals.insert(name, value);
+            }
+            Instruction::LoadOption { scope, name } => {
+                let name = self.constant_string(&module, function_id, name)?;
+                return Ok(StepOutcome::OptionCall(OptionRequest {
+                    operation: OptionRequestOperation::Get,
+                    name,
+                    scope: option_request_scope(scope),
+                    context: self.host_context.clone(),
+                }));
+            }
+            Instruction::StoreOption { scope, name } => {
+                let name = self.constant_string(&module, function_id, name)?;
+                let value = self.pop()?;
+                return Ok(StepOutcome::OptionCall(OptionRequest {
+                    operation: OptionRequestOperation::Set(value),
+                    name,
+                    scope: option_request_scope(scope),
+                    context: self.host_context.clone(),
+                }));
             }
             Instruction::Pop => {
                 self.pop()?;
@@ -1102,6 +1141,14 @@ fn runtime_code(kind: &RuntimeErrorKind) -> Option<&'static str> {
         RuntimeErrorKind::ResourceLimit => Some("E1240"),
         RuntimeErrorKind::InvalidCommand => Some("E492"),
         _ => None,
+    }
+}
+
+fn option_request_scope(scope: OptionScopeOperand) -> OptionRequestScope {
+    match scope {
+        OptionScopeOperand::Unqualified => OptionRequestScope::Unqualified,
+        OptionScopeOperand::Local => OptionRequestScope::Local,
+        OptionScopeOperand::Global => OptionRequestScope::Global,
     }
 }
 
